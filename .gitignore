@@ -1,0 +1,10 @@
+.vscode/
+*.log
+.DS_Store
+client/node_modules/
+client/dist/
+client/.vite/
+server/justdrop        
+server/*.exe
+server/*.out
+bin/
