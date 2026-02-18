@@ -209,6 +209,10 @@ async function createPeerConnection(iceServers: RTCIceServer[], iceTransportPoli
     const peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy });
 
     peerConnection.onicecandidateerror = (event) => {
+        if (event.errorCode === 701) {
+            console.warn("ICE candidate timeout (non-fatal):", event.url ?? "unknown-url", event.errorText);
+            return;
+        }
         console.error("ICE candidate error:", event);
     };
 

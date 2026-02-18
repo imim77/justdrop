@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -24,9 +25,13 @@ type Config struct {
 	Host         string
 	Port         string
 	TURNPort     int
+	TURNTLSPort  int
+	TURNTLSCert  string
+	TURNTLSKey   string
 	TURNRealm    string
 	TURNSecret   string
 	PublicIP     string
+	PublicHost   string
 	RelayPortMin int
 	RelayPortMax int
 }
@@ -82,6 +87,12 @@ func startTURN(cfg *Config) {
 		}
 		relayIP = resolved.IP
 	}
+	if isPrivateOrLoopbackIP(relayIP) {
+		log.Printf(
+			"TURN warning: relay IP %s is private/loopback; peers outside this network will fail unless JUSTDROP_PUBLIC_IP/PUBLIC_IP is a public address and NAT forwards TURN+relay UDP ports",
+			relayIP.String(),
+		)
+	}
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.TURNPort)
 
 	udpListener, err := net.ListenPacket("udp4", addr)
@@ -99,6 +110,35 @@ func startTURN(cfg *Config) {
 		Address:      "0.0.0.0",
 		MinPort:      uint16(cfg.RelayPortMin),
 		MaxPort:      uint16(cfg.RelayPortMax),
+	}
+
+	listenerConfigs := []turn.ListenerConfig{
+		{
+			Listener:              tcpListener,
+			RelayAddressGenerator: relayGen,
+		},
+	}
+
+	if cfg.turnTLSEnabled() {
+		tlsCert, certErr := tls.LoadX509KeyPair(cfg.TURNTLSCert, cfg.TURNTLSKey)
+		if certErr != nil {
+			log.Fatalf("Failed to load TURN TLS certificate/key: %v", certErr)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{tlsCert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		tlsAddr := fmt.Sprintf("0.0.0.0:%d", cfg.TURNTLSPort)
+		tlsTCPListener, tlsErr := net.Listen("tcp4", tlsAddr)
+		if tlsErr != nil {
+			log.Fatalf("Failed to listen TCP for TURN TLS: %v", tlsErr)
+		}
+		tlsListener := tls.NewListener(tlsTCPListener, tlsConfig)
+		listenerConfigs = append(listenerConfigs, turn.ListenerConfig{
+			Listener:              tlsListener,
+			RelayAddressGenerator: relayGen,
+		})
 	}
 
 	_, err = turn.NewServer(turn.ServerConfig{
@@ -126,12 +166,7 @@ func startTURN(cfg *Config) {
 				RelayAddressGenerator: relayGen,
 			},
 		},
-		ListenerConfigs: []turn.ListenerConfig{
-			{
-				Listener:              tcpListener,
-				RelayAddressGenerator: relayGen,
-			},
-		},
+		ListenerConfigs: listenerConfigs,
 	})
 	if err != nil {
 		log.Fatalf("Failed to start TURN server: %v", err)
@@ -139,22 +174,32 @@ func startTURN(cfg *Config) {
 
 	log.Printf("TURN server listening on UDP+TCP :%d (realm=%s, publicIP=%s, relay=%d-%d)",
 		cfg.TURNPort, cfg.TURNRealm, publicIp, cfg.RelayPortMin, cfg.RelayPortMax)
+	if cfg.turnTLSEnabled() {
+		log.Printf("TURN TLS listener enabled on TCP :%d (cert=%s)", cfg.TURNTLSPort, cfg.TURNTLSCert)
+	}
 }
 
 func buildIceServers(cfg *Config, r *http.Request) []IceServerInfo {
 	hosts := gatherIceHosts(cfg, r)
-	port := strconv.Itoa(cfg.TURNPort)
+	stunURLs := make([]string, 0, len(hosts)+2)
+	turnURLs := make([]string, 0, len(hosts)*3)
 
-	stunURLs := make([]string, 0, len(hosts))
-	turnURLs := make([]string, 0, len(hosts)*2)
 	for _, host := range hosts {
-		hostPort := net.JoinHostPort(host, port)
-		stunURLs = append(stunURLs, fmt.Sprintf("stun:%s", hostPort))
+		turnHostPort := net.JoinHostPort(host, strconv.Itoa(cfg.TURNPort))
+		stunURLs = append(stunURLs, fmt.Sprintf("stun:%s", turnHostPort))
 		turnURLs = append(turnURLs,
-			fmt.Sprintf("turn:%s?transport=udp", hostPort),
-			fmt.Sprintf("turn:%s?transport=tcp", hostPort),
+			fmt.Sprintf("turn:%s?transport=udp", turnHostPort),
+			fmt.Sprintf("turn:%s?transport=tcp", turnHostPort),
 		)
+		if cfg.turnTLSEnabled() {
+			turnsHostPort := net.JoinHostPort(host, strconv.Itoa(cfg.TURNTLSPort))
+			turnURLs = append(turnURLs, fmt.Sprintf("turns:%s?transport=tcp", turnsHostPort))
+		}
 	}
+
+	// Public STUN fallback helps diagnose routing problems when the TURN/STUN host itself is unreachable.
+	//stunURLs = appendUniqueURL(stunURLs, "stun:stun.l.google.com:19302")
+	//stunURLs = appendUniqueURL(stunURLs, "stun:stun.cloudflare.com:3478")
 
 	servers := []IceServerInfo{{URLs: stunURLs}}
 
@@ -164,7 +209,7 @@ func buildIceServers(cfg *Config, r *http.Request) []IceServerInfo {
 
 	turnUser, turnPass := generateTURNCredentials(cfg.TURNSecret, 24*time.Hour)
 	servers = append(servers, IceServerInfo{
-		URLs:       turnURLs,
+		URLs:       dedupeURLs(turnURLs),
 		Username:   turnUser,
 		Credential: turnPass,
 	})
@@ -173,24 +218,39 @@ func buildIceServers(cfg *Config, r *http.Request) []IceServerInfo {
 }
 
 func gatherIceHosts(cfg *Config, r *http.Request) []string {
+	forwardedHost := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0])
 	candidates := []string{
+		cfg.PublicHost,
 		cfg.PublicIP,
+		forwardedHost,
 		r.Host,
 		r.URL.Host,
 	}
 
 	seen := make(map[string]struct{}, len(candidates))
 	hosts := make([]string, 0, len(candidates))
+
 	for _, candidate := range candidates {
 		host := normalizeIceHost(candidate)
 		if host == "" {
 			continue
+		}
+		if host == "localhost" {
+			host = "127.0.0.1"
 		}
 		if _, ok := seen[host]; ok {
 			continue
 		}
 		seen[host] = struct{}{}
 		hosts = append(hosts, host)
+
+		if ip := net.ParseIP(host); ip != nil && isPrivateOrLoopbackIP(ip) {
+			log.Printf(
+				"TURN warning: advertising private ICE host %s to client %s; set JUSTDROP_PUBLIC_HOST to your public TURN DNS name for internet peers",
+				host,
+				r.RemoteAddr,
+			)
+		}
 	}
 
 	if len(hosts) == 0 {
@@ -198,6 +258,44 @@ func gatherIceHosts(cfg *Config, r *http.Request) []string {
 	}
 
 	return hosts
+}
+
+func dedupeURLs(urls []string) []string {
+	if len(urls) == 0 {
+		return urls
+	}
+
+	seen := make(map[string]struct{}, len(urls))
+	deduped := make([]string, 0, len(urls))
+	for _, url := range urls {
+		key := strings.ToLower(strings.TrimSpace(url))
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, strings.TrimSpace(url))
+	}
+	return deduped
+}
+
+func appendUniqueURL(urls []string, next string) []string {
+	key := strings.ToLower(strings.TrimSpace(next))
+	if key == "" {
+		return urls
+	}
+	for _, existing := range urls {
+		if strings.ToLower(strings.TrimSpace(existing)) == key {
+			return urls
+		}
+	}
+	return append(urls, strings.TrimSpace(next))
+}
+
+func (cfg *Config) turnTLSEnabled() bool {
+	return cfg.TURNTLSCert != "" && cfg.TURNTLSKey != ""
 }
 
 func normalizeIceHost(raw string) string {
@@ -224,6 +322,13 @@ func normalizeIceHost(raw string) string {
 	return strings.Trim(raw, "[]")
 }
 
+func isPrivateOrLoopbackIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
 func websocketHandler(cfg *Config, hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -239,6 +344,7 @@ func websocketHandler(cfg *Config, hub *Hub, w http.ResponseWriter, r *http.Requ
 
 	peers, existing := hub.Register(client)
 	iceServers := buildIceServers(cfg, r)
+	log.Printf("HELLO ICE servers for %s (%s): %s", client.ID, r.RemoteAddr, summarizeIceServers(iceServers))
 	client.enqueueJSON(HelloMessage{
 		Type:       "HELLO",
 		Client:     client.PublicInfo(),
@@ -539,4 +645,20 @@ func (c *Client) writeMessages() {
 			}
 		}
 	}
+}
+
+func summarizeIceServers(servers []IceServerInfo) string {
+	if len(servers) == 0 {
+		return "[]"
+	}
+
+	parts := make([]string, 0, len(servers))
+	for _, server := range servers {
+		label := "stun"
+		if server.Username != "" || server.Credential != "" {
+			label = "turn"
+		}
+		parts = append(parts, fmt.Sprintf("{type=%s urls=%v hasAuth=%t}", label, server.URLs, server.Username != "" && server.Credential != ""))
+	}
+	return strings.Join(parts, " ")
 }

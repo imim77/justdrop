@@ -8,3 +8,5 @@ server/justdrop
 server/*.exe
 server/*.out
 bin/
+.env
+.gocache/
