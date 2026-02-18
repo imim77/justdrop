@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import SignalingConnection, { type ClientInfo, type WsServerMessage } from "../services/serverconn";
   import { getDefaultIceServers, handleRemoteCandidate, receiveFiles, sendFiles } from "../services/webrtc";
+  import { FileChunker, FileDigester, type ReceivedFile } from "../services/files";
 
   let connection = $state<SignalingConnection | null>(null);
   let peers = $state<ClientInfo[]>([]);
@@ -19,7 +20,7 @@
     return () => {
       if (connection) {
         connection.close();
-      }
+      } 
     };
   });
 
@@ -156,6 +157,9 @@
     }
     return myId < peerId;
   }
+
+
+
 </script>
 
 <div class="container">
@@ -176,6 +180,8 @@
     </ul>
   {/if}
 </div>
+
+
 
 <style>
   .container {
